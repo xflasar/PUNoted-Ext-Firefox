@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "PUNoted Data Forwarder",
+  "version": "1.0",
+  "description": "Browser extension to capture Prosperous Universe data, authenticate users, and forward data in batches.",
+  "permissions": [
+    "scripting",
+    "storage",
+    "cookies"
+  ],
+  "host_permissions": [
+    "https://apex.prosperousuniverse.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://apex.prosperousuniverse.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected-script.js", "prun-message-decoder.js"],
+      "matches": ["https://apex.prosperousuniverse.com/*"]
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png"
+  }
+}
