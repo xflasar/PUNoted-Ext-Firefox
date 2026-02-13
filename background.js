@@ -1,581 +1,616 @@
-const SERVER_URL = '';
-const DATA_SERVER_URL = '';
+// ------------------ Initialization Logic ------------------
+let resolveInitializationPromise;
+const initializationPromise = new Promise((res) => {
+	resolveInitializationPromise = res;
+});
 
-const BATCH_INTERVAL_MS = 5000;
-const MAX_BATCH_SIZE = 10;
-const QUEUE_DB_NAME = 'prunDataQueue';
-const QUEUE_STORE_NAME = 'dataItems';
-const SERVER_CHECK_INTERVAL_MS = 10000;
+// ------------------ Config & State ------------------
+const SERVER_URL = "https://punoted.ddns.net/api/auth";
+const DATA_SERVER_URL = "https://punoted.ddns.net/api";
+const QUEUE_DB_NAME = "prunDataQueue";
+const QUEUE_STORE_NAME = "dataItems";
+const MAX_PAYLOAD_SIZE = 50_000;
+const MIN_INTERVAL = 500;
+const MAX_INTERVAL = 10000;
 
-const TOKEN_LIFESPAN_SECONDS_CLIENT_SIDE_ESTIMATE = 31536000;
-
-let isSending = false;
 let auth_token = null;
 let username = null;
-let auth_token_expires_at = null;
 let puDebugEnabled = false;
+let messageTypeSettings = {};
 
-let successfulSentCount = 0;
 let messagesInQueueCount = 0;
 let serverReachable = false;
 
-// --- IndexedDB Setup ---
+const idSet = new Set();
+let isSending = false;
+let lastRequestDuration = 0;
+let currentBatchInterval = 1000;
+let batchIntervalId = null;
+
+// --- Message Type Groups ---
+const HARDCODED_IGNORED_MESSAGE_TYPES = [
+	"SYSTEM_TRAFFIC_SHIP",
+	"CHANNEL_DATA",
+	"CHANNEL_UNSEEN_MESSAGES_COUNT",
+	"TUTORIAL_TUTORIALS",
+	"ALERTS_ALERTS",
+	"UI_STACKS_STACKS",
+	"UI_DATA",
+	"CHANNEL_USER_LIST",
+	"CHANNEL_MESSAGE_LIST",
+	"PRESENCE_LIST",
+	"FCM_SUBSCRIPTION_UPDATE",
+	"SYSTEM_DATA_UPDATED",
+	"PLANET_DATA_UPDATED",
+	"LEADERBOARD_UPDATED",
+	"NOTIFICATIONS_CONFIG",
+	"SYSTEM_TRAFFIC",
+	"ALERTS_ALERT",
+	"CONTRACT_DRAFTS_DRAFTS",
+	"CONTRACTS_PARTNERS",
+	"CHANNEL_CLIENT_MEMBERSHIP",
+	"COMEX_TICKER_INVALID",
+	"SHIP_FLIGHT_MISSION",
+	"CHANNEL_STARTED_TYPING",
+	"CHANNEL_STOPPED_TYPING",
+	"CHANNEL_MESSAGE_ADDED",
+	"UI_SCREENS_SET_STATE",
+	"ALERTS_ALERTS_DELETED",
+	"CHANNEL_USER_LEFT",
+	"CONTRACT_DRAFTS_DRAFT",
+	"CORPORATION_MANAGER_INVITE",
+	"CORPORATION_MANAGER_INVITES",
+	"CHANNEL_MESSAGE_DELETED",
+	"UI_TILES_REMOVE",
+	"UI_TILES_CHANGE_SIZE",
+	"CHANNEL_USER_JOINED",
+	"SYSTEM_TRAFFIC_SHIP_REMOVED",
+];
+
+const HARDCODED_ALWAYS_SEND_MESSAGE_TYPES = [
+	"USER_DATA",
+	"COMPANY_DATA",
+	"SITE_SITES",
+	"STORAGE_STORAGES",
+	"WAREHOUSE_STORAGES",
+	"SHIP_SHIPS",
+	"WORKFORCE_WORKFORCES",
+];
+
+const USER_CONTROLLABLE_MESSAGE_TYPES_DEFAULTS = {
+	STORAGE_CHANGE: true,
+	WORKFORCE_CHANGE: true,
+	ACTION_COMPLETED: true,
+	DATA_DATA: true,
+	ACCOUNTING_CASH_BALANCES: true,
+	CORPORATION_SHAREHOLDER_HOLDINGS: true,
+	SHIP_FLIGHT_FLIGHTS: true,
+	CONTRACTS_CONTRACTS: true,
+	PLANET_DATA: true,
+	PRODUCTION_SITE_PRODUCTION_LINES: true,
+	COMEX_TRADER_ORDERS: true,
+	POPULATION_AVAILABLE_RESERVE_WORKFORCE: true,
+	FOREX_TRADER_ORDERS: true,
+	SHIPYARD_PROJECTS: true,
+	BLUEPRINT_BLUEPRINTS: true,
+	PRODUCTION_ORDER_REMOVED: true,
+	PRODUCTION_ORDER_UPDATED: true,
+	ACCOUNTING_BOOKINGS: true,
+	PRODUCTION_ORDER_ADDED: true,
+	COMEX_EXCHANGE_BROKER_LIST: true,
+	COMEX_BROKER_DATA: true,
+	DATA_AGGREGATION_DATA: true,
+	PRODUCTION_PRODUCTION_LINES: true,
+	EXPERTS_EXPERTS: true,
+	CORPORATION_DATA: true,
+	CORPORATION_PROJECTS_DATA: true,
+	SHIP_FLIGHT_FLIGHT_ENDED: true,
+	SHIP_DATA: true,
+	SHIP_FLIGHT_FLIGHT: true,
+	COMEX_TRADER_ORDER_DELETION_TERMS: true,
+	COMEX_TRADER_ORDER_REMOVED: true,
+	SITE_NO_SITE: true,
+	AUTH_AUTHENTICATED: true,
+	SITE_SITE: true,
+	USER_STARTING_PROFILE_DATA: true,
+	PRODUCTION_PRODUCTION_LINE_UPDATED: true,
+	WORKFORCE_WORKFORCES_UPDATED: true,
+	SITE_PLATFORM_UPDATED: true,
+	COUNTRY_AGENT_DATA: true,
+	CONTRACTS_CONTRACT: true,
+	COMEX_TRADER_ORDER_UPDATED: true,
+	COMEX_TRADER_ORDER_ADDED: true,
+	LEADERBOARD_SCORES: true,
+	COMEX_BROKER_NEW_PRICE: true,
+	COMEX_BROKER_PRICES: true,
+	ACCOUNTING_BALANCES: true,
+	ACCOUNTING_CASH_BOOKINGS: true,
+	WAREHOUSE_STORAGE: true,
+	SITE_PLATFORM_BUILT: true,
+	ADMIN_CENTER_CLIENT_VOTING_DATA: true,
+	SHIPYARD_PROJECT: true,
+	BLUEPRINT_BLUEPRINT: true,
+	STORAGE_REMOVED: true,
+	SERVER_CONNECTION_OPENED: true,
+};
+
+// ------------------ Listeners ------------------
+
+// 1. Install/Update Listener
+browser.runtime.onInstalled.addListener((details) => {
+	if (details.reason === "install") {
+		// Automatically open the website to trigger the web_sync
+		browser.tabs.create({ url: "https://punoted.ddns.net/" });
+	}
+});
+
+// 2. Watchdog Alarm (Passive Autosync)
+browser.alarms.create("pulse", { periodInMinutes: 1 });
+
+browser.alarms.onAlarm.addListener(async (alarm) => {
+	if (alarm.name === "pulse") {
+		await initializationPromise;
+
+		console.log("[Background] Pulse check - Queue size:", messagesInQueueCount);
+
+		await checkServerStatus();
+
+		if (auth_token && serverReachable && messagesInQueueCount > 0) {
+			console.log("[Background] Alarm-triggered batch run started.");
+			runBatch();
+		}
+	}
+});
+
+browser.alarms.onAlarm.addListener(async (alarm) => {
+	if (alarm.name === "queueWatchdog") {
+		await initializationPromise; // Ensure DB and Auth are loaded
+		if (messagesInQueueCount > 0 && auth_token && serverReachable) {
+			console.log("[Background] Watchdog flushing queue...");
+			runBatch(); // Process the bulk data
+		}
+	}
+});
+
+browser.tabs.onActivated.addListener(async (activeInfo) => {
+	await initializationPromise;
+	// When user switch tabs, tell all tabs to flush their local buffers
+	const tabs = await browser.tabs.query({
+		url: "*://apex.prosperousuniverse.com/*",
+	});
+	for (const tab of tabs) {
+		browser.tabs.sendMessage(tab.id, { type: "FORCE_FLUSH" }).catch(() => {});
+	}
+
+	// Also trigger a batch run just in case
+	if (auth_token && messagesInQueueCount > 0) {
+		runBatch();
+	}
+});
+
+// 3. Port Listener (Game Communication)
+browser.runtime.onConnect.addListener((port) => {
+	if (!port || port.name !== "prun_keep_alive") return;
+	port.onMessage.addListener(async (msg) => {
+		await initializationPromise;
+		try {
+			if (msg.type === "PRUN_DATA_CAPTURED_BATCH") {
+				const payload = Array.isArray(msg.payload) ? msg.payload : [];
+				const ackIds = [];
+				for (const item of payload) {
+					const mType = item?.message?.messageType;
+					let shouldSend =
+						HARDCODED_ALWAYS_SEND_MESSAGE_TYPES.includes(mType) ||
+						messageTypeSettings[mType] === true;
+					if (shouldSend && auth_token && username) {
+						await addToIndexedDB(item);
+						ackIds.push(item.id);
+					}
+				}
+				port.postMessage({
+					type: "PRUN_DATA_CAPTURED_BATCH_ACK",
+					success: true,
+					successfullyQueuedIds: ackIds,
+					isUserLoggedIn: !!auth_token,
+				});
+				if (auth_token && serverReachable && !batchIntervalId)
+					startBatchSender();
+			} else if (msg.type === "KEEPALIVE") {
+				port.postMessage({ type: "ALIVE" });
+			}
+		} catch (err) {
+			console.error("[Background] Port Error:", err);
+		}
+	});
+});
+
+// 4. Message Listener (Popup & Web Sync Bridge)
+browser.runtime.onMessage.addListener(async (request, sender) => {
+	await initializationPromise;
+
+	// Handle Logic for Web Sync Bridge (from punoted.ddns.net)
+	if (request.type === "SYNC_FROM_WEB") {
+		// request.payload.token comes from your web_sync.js content script
+		const success = await syncWithWebToken(request.payload.token);
+		return { success };
+	}
+
+	// Handle Logic for Popup or Game Tab
+	switch (request.type) {
+		case "GET_LOGIN_STATUS":
+			return { isLoggedIn: !!auth_token };
+		case "GET_AUTH_STATUS":
+			return { isLoggedIn: !!auth_token, username, puDebugEnabled };
+		case "LOGIN":
+			return loginUser(request.payload.username, request.payload.password);
+		case "LOGOUT":
+			return logoutUser();
+		case "FORCE_SERVER_CHECK":
+			await checkServerStatus();
+			return { serverReachable, messagesInQueueCount };
+		case "QUEUEREMOVE":
+			await clearEntireQueue();
+			return { success: true };
+		case "SET_MESSAGE_TYPE_SETTINGS":
+			Object.assign(messageTypeSettings, request.payload || {});
+			await browser.storage.local.set({ messageTypeSettings });
+			return { success: true };
+		case "GET_MESSAGE_TYPE_SETTINGS":
+			return messageTypeSettings;
+		case "GET_MESSAGE_TYPE_SETTINGS_ALWAYS_SEND":
+			return HARDCODED_ALWAYS_SEND_MESSAGE_TYPES;
+		default:
+			return { success: false };
+	}
+});
+
+// ------------------ Core Functions ------------------
+
+const EXTENSION_HEADER = { "X-Extension-Client": "PrunDataExtension" };
+
+async function syncWithWebToken(webToken) {
+	try {
+		console.log("[Background] Attempting extension_sync with web token...");
+
+		const res = await fetch(`${SERVER_URL}/extension_sync`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${webToken}`,
+				...EXTENSION_HEADER,
+			},
+		});
+
+		const data = await res.json();
+
+		if (res.ok && data.success) {
+			// 1. Update memory
+			auth_token = data.token;
+			username = data.username;
+
+			// 2. Update storage
+			await browser.storage.local.set({
+				auth_token: data.token,
+				username: data.username,
+			});
+
+			// 3. Update UI and State
+			serverReachable = true;
+			browser.runtime
+				.sendMessage({
+					type: "AUTH_STATUS_UPDATED",
+					isLoggedIn: true,
+					username: data.username,
+				})
+				.catch(() => {});
+
+			startBatchSender();
+			console.log("[Background] Extension sync successful for:", data.username);
+			return true;
+		} else {
+			console.warn(
+				"[Background] Extension sync rejected by server:",
+				data.message,
+			);
+		}
+	} catch (e) {
+		console.error("[Background] Sync failed error:", e);
+	}
+	return false;
+}
+
+async function runBatch() {
+	if (isSending || !auth_token || !serverReachable) return;
+	isSending = true;
+	const start = Date.now();
+
+	try {
+		const db = await openDb();
+		const tx = db.transaction([QUEUE_STORE_NAME], "readonly");
+		const store = tx.objectStore(QUEUE_STORE_NAME);
+
+		// 1. We only look at a small window of items to avoid loading 100MB into RAM
+		const allItems = await new Promise((r) => {
+			const items = [];
+			const req = store.openCursor();
+			req.onsuccess = (e) => {
+				const cursor = e.target.result;
+				// Limit the CURSOR to 500 items max to protect background memory
+				if (cursor && items.length < 500) {
+					items.push({ key: cursor.key, value: cursor.value });
+					cursor.continue();
+				} else r(items);
+			};
+		});
+
+		if (allItems.length === 0) {
+			isSending = false;
+			return;
+		}
+
+		// 2. Build exactly ONE batch that stays under MAX_PAYLOAD_SIZE
+		let batch = [];
+		let batchSize = 0;
+		let itemsProcessed = 0;
+
+		for (const item of allItems) {
+			const serialized = JSON.stringify(item.value);
+			const itemBytes = serialized.length;
+
+			// If a single message is bigger than the whole limit, drop it (unblocks queue)
+			if (itemBytes > MAX_PAYLOAD_SIZE) {
+				console.warn(
+					"[Sync] Dropping monster message to unblock queue",
+					item.key,
+				);
+				await clearIndexedDB([item.key]);
+				continue;
+			}
+
+			if (batchSize + itemBytes > MAX_PAYLOAD_SIZE) break;
+
+			batch.push(item.value);
+			batchSize += itemBytes;
+			itemsProcessed++;
+		}
+
+		if (batch.length === 0) {
+			isSending = false;
+			return;
+		}
+
+		// 3. Send the single safe batch
+		const compressedBody = await gzipPayload({ data: batch });
+		const resp = await fetch(
+			`${DATA_SERVER_URL}/data_batch?conn=${encodeURIComponent(username)}`,
+			{
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${auth_token}`,
+					"Content-Encoding": "gzip",
+					"Content-Type": "application/json",
+				},
+				body: compressedBody,
+			},
+		);
+
+		if (resp.ok) {
+			const keysToClear = allItems.slice(0, itemsProcessed).map((i) => i.key);
+			await clearIndexedDB(keysToClear);
+
+			if (allItems.length >= 500 || itemsProcessed < allItems.length) {
+				setTimeout(runBatch, 1000);
+			}
+		} else if (resp.status === 400 || resp.status === 408) {
+			console.error(
+				`[Sync] Server returned ${resp.status}. Clearing malformed batch.`,
+			);
+			const keysToClear = allItems.slice(0, itemsProcessed).map((i) => i.key);
+			await clearIndexedDB(keysToClear);
+
+			setTimeout(runBatch, 1000);
+		} else if (resp.status === 401 || resp.status === 403) {
+			await logoutUser();
+		} else {
+			serverReachable = false;
+		}
+	} catch (e) {
+		serverReachable = false;
+	} finally {
+		lastRequestDuration = Date.now() - start;
+		adjustBatchInterval();
+		isSending = false;
+	}
+}
+
+// ------------------ Helpers ------------------
+
+async function gzipPayload(payload) {
+	const stream = new ReadableStream({
+		start(controller) {
+			controller.enqueue(new TextEncoder().encode(JSON.stringify(payload)));
+			controller.close();
+		},
+	}).pipeThrough(new CompressionStream("gzip"));
+	return await new Response(stream).arrayBuffer();
+}
+
 function openDb() {
-    return new Promise((resolve, reject) => {
-        const request = indexedDB.open(QUEUE_DB_NAME, 1);
-
-        request.onupgradeneeded = (event) => {
-            const db = event.target.result;
-            if (!db.objectStoreNames.contains(QUEUE_STORE_NAME)) {
-                db.createObjectStore(QUEUE_STORE_NAME, { autoIncrement: true });
-            }
-        };
-
-        request.onsuccess = (event) => {
-            resolve(event.target.result);
-        };
-
-        request.onerror = (event) => {
-            console.error('IndexedDB error:', event.target.errorCode);
-            reject(event.target.error);
-        };
-    });
+	return new Promise((res, rej) => {
+		const req = indexedDB.open(QUEUE_DB_NAME, 1);
+		req.onupgradeneeded = (e) =>
+			e.target.result.createObjectStore(QUEUE_STORE_NAME, {
+				autoIncrement: true,
+			});
+		req.onsuccess = (e) => res(e.target.result);
+		req.onerror = (e) => rej(e.target.error);
+	});
 }
 
 async function addToIndexedDB(item) {
-    const db = await openDb();
-    const transaction = db.transaction([QUEUE_STORE_NAME], 'readwrite');
-    const store = transaction.objectStore(QUEUE_STORE_NAME);
-    return new Promise((resolve, reject) => {
-        const request = store.add(item);
-        request.onsuccess = () => {
-            console.log('[Background] Added item to IndexedDB.');
-            messagesInQueueCount++;
-            resolve();
-        };
-        request.onerror = () => {
-            console.error('[Background] Failed to add item to IndexedDB:', request.error);
-            reject(request.error);
-        };
-    });
-}
-
-async function getFromIndexedDB() {
-    const db = await openDb();
-    const transaction = db.transaction([QUEUE_STORE_NAME], 'readonly');
-    const store = transaction.objectStore(QUEUE_STORE_NAME);
-    return new Promise((resolve, reject) => {
-        const request = store.getAll();
-        request.onsuccess = () => {
-            console.log(`[Background] Retrieved ${request.result.length} items from IndexedDB.`);
-            resolve(request.result);
-        };
-        request.onerror = () => {
-            console.error('[Background] Failed to get items from IndexedDB:', request.error);
-            reject(request.error);
-        };
-    });
+	if (!item?.id || idSet.has(item.id)) return;
+	const db = await openDb();
+	db
+		.transaction([QUEUE_STORE_NAME], "readwrite")
+		.objectStore(QUEUE_STORE_NAME)
+		.add(item).onsuccess = () => {
+		idSet.add(item.id);
+		messagesInQueueCount++;
+		browser.runtime
+			.sendMessage({
+				type: "QUEUE_COUNT_UPDATED",
+				queueCount: messagesInQueueCount,
+			})
+			.catch(() => {});
+	};
 }
 
 async function clearIndexedDB(keys) {
-    if (keys.length === 0) {
-        console.log('[Background] No keys to clear from IndexedDB.');
-        return;
-    }
-    const db = await openDb();
-    const transaction = db.transaction([QUEUE_STORE_NAME], 'readwrite');
-    const store = transaction.objectStore(QUEUE_STORE_NAME);
-    return new Promise((resolve, reject) => {
-        const deletePromises = keys.map(key => {
-            return new Promise((res, rej) => {
-                const request = store.delete(key);
-                request.onsuccess = () => res();
-                request.onerror = () => rej(request.error);
-            });
-        });
-        Promise.all(deletePromises)
-            .then(() => {
-                console.log(`[Background] Cleared ${keys.length} items from IndexedDB.`);
-                updateQueueCountFromDb();
-                resolve();
-            })
-            .catch(error => {
-                console.error('[Background] Error clearing IndexedDB:', error);
-                reject(error);
-            });
-    });
+	const db = await openDb();
+	const tx = db.transaction([QUEUE_STORE_NAME], "readwrite");
+	const store = tx.objectStore(QUEUE_STORE_NAME);
+	keys.forEach((k) => store.delete(k));
+	messagesInQueueCount = Math.max(0, messagesInQueueCount - keys.length);
+	browser.runtime
+		.sendMessage({
+			type: "QUEUE_COUNT_UPDATED",
+			queueCount: messagesInQueueCount,
+		})
+		.catch(() => {});
 }
 
-async function wipeIndexedDB() {
-    const db = await openDb();
-    const transaction = db.transaction([QUEUE_STORE_NAME], 'readwrite');
-    const store = transaction.objectStore(QUEUE_STORE_NAME);
-
-    return new Promise((resolve, reject) => {
-        const request = store.clear();
-
-        request.onsuccess = () => {
-            console.log(`[Background] Cleared all items from IndexedDB.`);
-            updateQueueCountFromDb();
-            resolve();
-        };
-
-        request.onerror = () => {
-            console.error('[Background] Error clearing IndexedDB: ', request.error);
-            reject(request.error);
-        };
-    });
+async function clearEntireQueue() {
+	const db = await openDb();
+	db.transaction([QUEUE_STORE_NAME], "readwrite")
+		.objectStore(QUEUE_STORE_NAME)
+		.clear();
+	idSet.clear();
+	messagesInQueueCount = 0;
+	browser.runtime
+		.sendMessage({ type: "QUEUE_COUNT_UPDATED", queueCount: 0 })
+		.catch(() => {});
 }
 
-async function updateQueueCountFromDb() {
-    const db = await openDb();
-    const transaction = db.transaction([QUEUE_STORE_NAME], 'readonly');
-    const store = transaction.objectStore(QUEUE_STORE_NAME);
-    return new Promise((resolve) => {
-        const request = store.count();
-        request.onsuccess = () => {
-            messagesInQueueCount = request.result;
-            console.log(`[Background] Updated messagesInQueueCount: ${messagesInQueueCount}`);
-            resolve();
-        };
-        request.onerror = () => {
-            console.error('[Background] Failed to get IndexedDB count:', request.error);
-            messagesInQueueCount = 0;
-            resolve();
-        };
-    });
-}
-
-
-// --- Server Reachability Check ---
-let serverCheckIntervalId = null;
-async function checkServerStatus() {
-    try {
-        const response = await fetch(`${DATA_SERVER_URL}/status`, { method: 'GET', signal: AbortSignal.timeout(5000) });
-        if (response.ok) {
-            serverReachable = true;
-            console.log('[Background] Server is reachable.');
-        } else {
-            serverReachable = false;
-            console.warn(`[Background] Server responded with status ${response.status}. Considering it unreachable.`);
-        }
-    } catch (error) {
-        serverReachable = false;
-        console.error('[Background] Server is unreachable (network error or timeout):', error.message);
-    }
-}
-
-function startServerChecker() {
-    if (serverCheckIntervalId) {
-        clearInterval(serverCheckIntervalId);
-    }
-    serverCheckIntervalId = setInterval(checkServerStatus, SERVER_CHECK_INTERVAL_MS);
-    checkServerStatus();
-    console.log('[Background] Server checker started.');
-}
-
-function stopServerChecker() {
-    if (serverCheckIntervalId) {
-        clearInterval(serverCheckIntervalId);
-        serverCheckIntervalId = null;
-        console.log('[Background] Server checker stopped.');
-    }
-}
-
-
-// --- Authentication Functions ---
-async function registerUser(username_input, email_input, password_input) {
-    console.log('[Background] Attempting registration for:', username_input, email_input);
-    try {
-        const response = await fetch(`${SERVER_URL}/register`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: username_input, email: email_input, password: password_input })
-        });
-        const data = await response.json();
-        if (response.ok) {
-            console.log('[Background] Registration response:', data);
-            return { success: data.success, message: data.message };
-        } else {
-            console.error('[Background] Registration failed:', data.message);
-            return { success: false, message: data.message || `Registration failed with status: ${response.status}` };
-        }
-    } catch (error) {
-        console.error('[Background] Registration fetch error:', error);
-        return { success: false, message: `Network error: ${error.message}. Server might be offline.` };
-    }
-}
-
-async function verifyEmail(email_input, code_input) {
-    console.log('[Background] Attempting email verification for:', email_input);
-    try {
-        const response = await fetch(`${SERVER_URL}/verify_email`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: email_input, code: code_input })
-        });
-        const data = await response.json();
-        if (response.ok) {
-            console.log('[Background] Email verification response:', data);
-            return { success: data.success, message: data.message };
-        } else {
-            console.error('[Background] Email verification failed:', data.message);
-            return { success: false, message: data.message || `Verification failed with status: ${response.status}` };
-        }
-    } catch (error) {
-        console.error('[Background] Email verification fetch error:', error);
-        return { success: false, message: `Network error: ${error.message}. Server might be offline.` };
-    }
-}
-
-async function resendVerificationCode(email_input) {
-    console.log('[Background] Attempting to resend verification code for:', email_input);
-    try {
-        const response = await fetch(`${SERVER_URL}/resend_verification_code`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: email_input })
-        });
-        const data = await response.json();
-        if (response.ok) {
-            console.log('[Background] Resend code response:', data);
-            return { success: data.success, message: data.message };
-        } else {
-            console.error('[Background] Resend code failed:', data.message);
-            return { success: false, message: data.message || `Resend failed with status: ${response.status}` };
-        }
-    } catch (error) {
-        console.error('[Background] Resend code fetch error:', error);
-        return { success: false, message: `Network error: ${error.message}. Server might be offline.` };
-    }
-}
-
-
-async function loginUser(username_input, password_input) {
-    console.log('[Background] Attempting login for:', username_input);
-    try {
-        const response = await fetch(`${SERVER_URL}/login`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: username_input, password: password_input })
-        });
-        const data = await response.json();
-        if (response.ok && data.success) {
-            auth_token = data.token;
-            username = data.username;
-            auth_token_expires_at = data.expires_at;
-            await chrome.storage.local.set({ auth_token, username, auth_token_expires_at });
-            startBatchSender();
-            console.log('[Background] Login successful. Token and expiration stored.');
-            serverReachable = true;
-            return { success: true, message: 'Logged in successfully!' };
-        } else {
-            console.error('[Background] Login failed:', data.message);
-            serverReachable = false;
-            return { success: false, message: data.message || `Login failed with status: ${response.status}` };
-        }
-    } catch (error) {
-        console.error('[Background] Login fetch error:', error);
-        serverReachable = false;
-        return { success: false, message: `Network error: ${error.message}. Server might be offline.` };
-    }
+async function loginUser(u, p) {
+	try {
+		const resp = await fetch(`${SERVER_URL}/login`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ username: u, password: p, isWebsite: "false" }),
+		});
+		const data = await resp.json();
+		if (resp.ok && data.success) {
+			auth_token = data.token;
+			username = data.username;
+			await browser.storage.local.set({ auth_token, username });
+			serverReachable = true;
+			startBatchSender();
+			return { success: true };
+		}
+		return { success: false, message: data.message };
+	} catch (e) {
+		return { success: false, message: e.message };
+	}
 }
 
 async function logoutUser() {
-    console.log('[Background] Logging out user.');
-    auth_token = null;
-    username = null;
-    auth_token_expires_at = null;
-    await chrome.storage.local.remove(['auth_token', 'username', 'auth_token_expires_at']);
-    stopBatchSender();
-    console.log('[Background] Logout successful. Token removed.');
-    return { success: true };
+	auth_token = null;
+	username = null;
+	await browser.storage.local.remove(["auth_token", "username"]);
+	stopBatchSender();
+	browser.alarms.clear("queueWatchdog");
+	browser.runtime
+		.sendMessage({ type: "AUTH_STATUS_UPDATED", isLoggedIn: false })
+		.catch(() => {});
+	return { success: true };
 }
 
-// --- Data Queuing and Sending ---
-async function sendBatch() {
-    console.log('[Background] sendBatch called (for regular messages).');
-    if (isSending) {
-        console.log('[Background] Already sending a batch. Skipping this call.');
-        return;
-    }
-
-    if (!auth_token || !username) {
-        console.warn('[Background] Not authenticated. Skipping sendBatch.');
-        await updateQueueCountFromDb();
-        return;
-    }
-
-    isSending = true;
-    let itemsToSend = [];
-    let keysToDelete = [];
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-    try {
-        const db = await openDb();
-        const transaction = db.transaction([QUEUE_STORE_NAME], 'readwrite');
-        const store = transaction.objectStore(QUEUE_STORE_NAME);
-        const cursorRequest = store.openCursor();
-
-        await new Promise((resolve, reject) => {
-            cursorRequest.onsuccess = (event) => {
-                const cursor = event.target.result;
-                if (cursor && itemsToSend.length < MAX_BATCH_SIZE) {
-                    itemsToSend.push(cursor.value);
-                    keysToDelete.push(cursor.key);
-                    cursor.continue();
-                } else {
-                    resolve();
-                }
-            };
-            cursorRequest.onerror = (event) => reject(event.target.error);
-        });
-
-        if (itemsToSend.length === 0) {
-            console.log('[Background] No items to send in batch.');
-            isSending = false;
-            return;
-        }
-
-        console.log(`[Background] Attempting to send batch of ${itemsToSend.length} regular items to ${DATA_SERVER_URL}/data_batch`);
-        itemsToSend.forEach(item => {
-            console.log(item)
-        });
-
-        const response = await fetch(`${DATA_SERVER_URL}/data_batch`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${auth_token}`
-            },
-            body: JSON.stringify({
-                data: itemsToSend,
-            }),
-            signal: controller.signal
-        });
-
-        clearTimeout(timeoutId);
-
-        if (response.ok) {
-            const responseData = await response.json();
-            console.log('[Background] Batch sent successfully!');
-            successfulSentCount += itemsToSend.length;
-            serverReachable = true;
-
-            if (responseData.new_token && responseData.new_expires_at) {
-                auth_token = responseData.new_token;
-                auth_token_expires_at = responseData.new_expires_at;
-                await chrome.storage.local.set({ auth_token, auth_token_expires_at });
-                console.log('[Background] Token refreshed successfully. New expiration:', new Date(auth_token_expires_at * 1000));
-            }
-
-            if (keysToDelete.length > 0) {
-                console.log(responseData.arrived_ids)
-                console.log(keysToDelete)
-                //keysToDelete.map(key => response.arrived_ids.contains(key))
-                await clearIndexedDB(keysToDelete);
-            }
-        } else if (response.status === 401) {
-            console.error('[Background] Batch sending failed: Unauthorized (401). Token might be expired or invalid. Data remains in queue.');
-            serverReachable = true;
-        } else {
-            console.error('Failed to send batch:', response.status, response.statusText, 'Data remains in queue.');
-            serverReachable = false;
-        }
-    } catch (error) {
-        clearTimeout(timeoutId);
-        if (error.name === 'AbortError') {
-            console.warn('[Background] Batch sending timed out (10s). Data remains in queue for retry.');
-        } else {
-            console.error('[Background] Network error sending batch:', error);
-        }
-        serverReachable = false;
-    } finally {
-        isSending = false;
-        await updateQueueCountFromDb();
-    }
+async function checkServerStatus() {
+	try {
+		const r = await fetch(`${DATA_SERVER_URL}/status`);
+		serverReachable = r.ok;
+	} catch (e) {
+		serverReachable = false;
+	}
 }
 
-// Function to send initial state immediately
-async function sendInitialState(context, nextState) {
-    if (!auth_token || !username) {
-        console.warn('[Background] Not authenticated. Skipping initial state upload.');
-        return;
-    }
-    console.log('[Background] Attempting to send initial state to /initial_state_upload.');
-
-    try {
-        const response = await fetch(`${DATA_SERVER_URL}/initial_state_upload`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${auth_token}`
-            },
-            body: JSON.stringify({
-                context: context,
-                initialState: nextState
-            })
-        });
-
-        if (response.ok) {
-            const responseData = await response.json();
-            console.log('[Background] Initial state sent successfully!', responseData);
-            serverReachable = true; // Server is reachable
-            if (responseData.new_token && responseData.new_expires_at) {
-                auth_token = responseData.new_token;
-                auth_token_expires_at = responseData.new_expires_at;
-                await chrome.storage.local.set({ auth_token, auth_token_expires_at });
-                console.log('[Background] Token refreshed during initial state upload. New expiration:', new Date(auth_token_expires_at * 1000));
-            }
-        } else if (response.status === 401) {
-            console.error('[Background] Initial state upload failed: Unauthorized (401). Token might be expired or invalid.');
-            serverReachable = true;
-        } else {
-            console.error('[Background] Failed to send initial state:', response.status, response.statusText);
-            serverReachable = false;
-        }
-    } catch (error) {
-        console.error('[Background] Network error sending initial state:', error);
-        serverReachable = false;
-    }
-}
-
-
-let batchIntervalId = null;
 function startBatchSender() {
-    if (batchIntervalId) {
-        clearInterval(batchIntervalId);
-    }
-    batchIntervalId = setInterval(sendBatch, BATCH_INTERVAL_MS);
-    console.log('[Background] Batch sender started.');
+	if (batchIntervalId) return;
+	// 1. Fast sync for active use
+	batchIntervalId = setInterval(() => {
+		if (serverReachable && messagesInQueueCount > 0) runBatch();
+	}, currentBatchInterval);
+
+	// 2. Persistent Watchdog for background/mobile use (triggers every 1 minute)
+	browser.alarms.create("queueWatchdog", { periodInMinutes: 1 });
 }
 
 function stopBatchSender() {
-    if (batchIntervalId) {
-        clearInterval(batchIntervalId);
-        batchIntervalId = null;
-        console.log('[Background] Batch sender stopped.');
-    }
+	clearInterval(batchIntervalId);
+	batchIntervalId = null;
+	browser.alarms.clear("queueWatchdog"); // Stop waking up if logged out
 }
 
-// --- Cookie Management for pu-debug ---
-async function setPuDebugCookie(enabled) {
-    puDebugEnabled = enabled;
-    await chrome.storage.local.set({ puDebugEnabled });
-    console.log(`[Background] Stored puDebugEnabled in chrome.storage.local: ${enabled}`);
-
-    const cookieValue = enabled ? 'true' : 'false';
-    const cookieUrl = 'https://apex.prosperousuniverse.com';
-
-    try {
-        await chrome.cookies.set({
-            url: cookieUrl,
-            name: 'pu-debug',
-            value: cookieValue,
-            expirationDate: (Date.now() / 1000) + (365 * 24 * 60 * 60)
-        });
-        console.log(`[Background] pu-debug cookie set to "${cookieValue}" for ${cookieUrl}.`);
-    } catch (error) {
-        console.error('[Background] Error setting pu-debug cookie:', error);
-    }
+function adjustBatchInterval() {
+	if (messagesInQueueCount > 50) currentBatchInterval = MIN_INTERVAL;
+	else if (lastRequestDuration > 2000)
+		currentBatchInterval = Math.min(MAX_INTERVAL, currentBatchInterval * 2);
+	else
+		currentBatchInterval = Math.max(
+			MIN_INTERVAL,
+			Math.floor(currentBatchInterval * 0.9),
+		);
+	if (batchIntervalId) {
+		stopBatchSender();
+		startBatchSender();
+	}
 }
 
-// --- Message Listener from Popup and Content Scripts ---
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    // Check if the message is from a content script (game page)
-    if (sender.tab && sender.tab.url && sender.tab.url.startsWith('https://apex.prosperousuniverse.com')) {
-        console.log(`[Background] Received message from content script (Tab ID: ${sender.tab.id}, Type: ${request.type})`);
-        if (request.type === 'PRUN_DATA_CAPTURED_BATCH') {
-            if (auth_token && username) {
-                console.log(request.payload)
-                addToIndexedDB(request.payload).then(() => {
-                    console.log('[Background] Data added to IndexedDB. Triggering sendBatch.');
-                    sendBatch();
-                    sendResponse({ success: true, message: 'Data received by background script.' });
-                }).catch(error => {
-                    console.error('[Background] Failed to add data to IndexedDB:', error);
-                    sendResponse({ success: false, message: 'Failed to queue data locally.' });
-                });
-                return true;
-            } else {
-                console.warn('[Background] Data captured but user not logged in. Skipping data processing.');
-                sendResponse({ success: false, message: 'User not logged in. Data not processed.' });
-            }
-        } else if (request.type === 'INITIAL_STATE_UPLOAD') {
-            sendInitialState(request.payload.context, request.payload.nextState).then(() => {
-                sendResponse({ success: true, message: 'Initial state processing initiated.' });
-            }).catch(error => {
-                console.error('[Background] Error processing INITIAL_STATE_UPLOAD:', error);
-                sendResponse({ success: false, message: 'Failed to process initial state upload.' });
-            });
-            return true;
-        }
-    } else {
-        console.log(`[Background] Received message from popup (Type: ${request.type})`);
-        switch (request.type) {
-            case 'REGISTER':
-                registerUser(request.payload.username, request.payload.email, request.payload.password).then(sendResponse);
-                return true;
-            case 'VERIFY_EMAIL':
-                verifyEmail(request.payload.email, request.payload.code).then(sendResponse);
-                return true;
-            case 'RESEND_VERIFICATION_CODE':
-                resendVerificationCode(request.payload.email).then(sendResponse);
-                return true;
-            case 'LOGIN':
-                loginUser(request.payload.username, request.payload.password).then(sendResponse);
-                return true;
-            case 'LOGOUT':
-                logoutUser().then(sendResponse);
-                return true;
-            case 'QUEUEREMOVE':
-                wipeIndexedDB()
-                sendResponse({
-                    success: true
-                })
-            case 'CHECK_AUTH_STATUS':
-                sendResponse({
-                    loggedIn: !!auth_token,
-                    username: username,
-                    puDebugEnabled: puDebugEnabled
-                });
-                break;
-            case 'SET_PU_DEBUG_CONSENT':
-                setPuDebugCookie(request.payload.enabled).then(() => sendResponse({ success: true }));
-                return true;
-            case 'GET_STATS':
-                sendResponse({
-                    successfulSentCount: successfulSentCount,
-                    queueCount: messagesInQueueCount,
-                    serverReachable: serverReachable
-                });
-                break;
-        }
-    }
-});
+// ------------------ Init ------------------
+(async function init() {
+	const s = await browser.storage.local.get([
+		"auth_token",
+		"username",
+		"messageTypeSettings",
+	]);
+	auth_token = s.auth_token || null;
+	username = s.username || null;
 
-// --- Initialization on Service Worker Startup ---
-async function initialize() {
-    console.log('[Background] Initializing service worker.');
-    const storedData = await chrome.storage.local.get(['auth_token', 'username', 'puDebugEnabled', 'auth_token_expires_at']);
-    auth_token = storedData.auth_token || null;
-    username = storedData.username || null;
-    puDebugEnabled = storedData.puDebugEnabled || false;
-    auth_token_expires_at = storedData.auth_token_expires_at || null;
+	if (!s.auth_token) {
+		console.log(
+			"[Background] No token found on init. Poking website for sync.",
+		);
 
-    console.log(`[Background] Initial state: LoggedIn=${!!auth_token}, Username=${username}, PuDebugEnabled=${puDebugEnabled}, ExpiresAt=${auth_token_expires_at ? new Date(auth_token_expires_at * 1000) : 'N/A'}`);
+		// 1. Try to find if the tab is already open and wake it up
+		const tabs = await browser.tabs.query({
+			url: "https://punoted.ddns.net/*",
+		});
+		if (tabs.length > 0) {
+			browser.tabs
+				.sendMessage(tabs[0].id, { type: "WAKE_UP_SYNC" })
+				.catch(() => {});
+		} else {
+			// 2. If not open, open it so web_sync.js can do its job
+			browser.tabs.create({ url: "https://punoted.ddns.net/" });
+		}
+	}
 
-    startServerChecker();
+	const saved = s.messageTypeSettings || {};
+	for (const t in USER_CONTROLLABLE_MESSAGE_TYPES_DEFAULTS) {
+		messageTypeSettings[t] = saved.hasOwnProperty(t)
+			? saved[t]
+			: USER_CONTROLLABLE_MESSAGE_TYPES_DEFAULTS[t];
+	}
 
-    await updateQueueCountFromDb();
+	await checkServerStatus();
+	const db = await openDb();
+	db
+		.transaction([QUEUE_STORE_NAME], "readonly")
+		.objectStore(QUEUE_STORE_NAME)
+		.count().onsuccess = (e) => {
+		messagesInQueueCount = e.target.result;
+		if (auth_token) startBatchSender();
+	};
 
-    if (auth_token) {
-        startBatchSender();
-    }
-
-    console.log('[Background] Checking IndexedDB for unsent data on startup.');
-    sendBatch();
-}
-
-initialize();
+	resolveInitializationPromise();
+})();

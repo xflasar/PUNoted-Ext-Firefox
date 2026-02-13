@@ -1,265 +1,273 @@
-// popup.js
 document.addEventListener('DOMContentLoaded', async () => {
-    const loginSection = document.getElementById('login-section');
-    const registerSection = document.getElementById('register-section');
-    const verifyEmailSection = document.getElementById('verify-email-section');
-    const dashboardSection = document.getElementById('dashboard-section');
+  // ====== Sections ======
+  const loginSection = document.getElementById('login-section');
+  const registerSection = document.getElementById('register-section');
+  const verifyEmailSection = document.getElementById('verify-email-section');
+  const dashboardSection = document.getElementById('dashboard-section');
+  const settingsSection = document.getElementById('settings-section');
 
-    const loginForm = document.getElementById('login-form');
-    const registerForm = document.getElementById('register-form');
-    const verifyEmailForm = document.getElementById('verify-email-form');
+  // ====== Forms ======
+  const loginForm = document.getElementById('login-form');
+  const registerForm = document.getElementById('register-form');
+  const verifyEmailForm = document.getElementById('verify-email-form');
 
-    const loginMessage = document.getElementById('login-message');
-    const registerMessage = document.getElementById('register-message');
-    const verifyEmailMessage = document.getElementById('verify-email-message');
+  // ====== Message boxes ======
+  const loginMessage = document.getElementById('login-message');
+  const registerMessage = document.getElementById('register-message');
+  const verifyEmailMessage = document.getElementById('verify-email-message');
 
-    const dashboardUsername = document.getElementById('dashboard-username');
-    const serverStatusIndicator = document.getElementById('server-status-indicator');
-    const serverStatusText = document.getElementById('server-status-text');
-    const successfulSentCount = document.getElementById('successful-sent-count');
-    const queueCountDisplay = document.getElementById('queue-count');
+  // ====== Dashboard elements ======
+  const dashboardUsername = document.getElementById('dashboard-username');
+  const successfulSentCountEl = document.getElementById('successful-sent-count');
+  const queueCountDisplay = document.getElementById('queue-count');
 
-    const logoutButton = document.getElementById('logout-button');
-    const consentPuDebug = document.getElementById('consent-pu-debug');
+  // ====== Controls ======
+  const logoutButton = document.getElementById('logout-button');
+  const consentPuDebug = document.getElementById('consent-pu-debug');
+  const queueRemoveButton = document.getElementById('queue-remove-button');
+  const saveSettingsButton = document.getElementById('save-settings-button');
 
-    const queueRemoveButton = document.getElementById('queue-remove-button')
+  // ====== Navigation links ======
+  const showRegisterLink = document.getElementById('show-register');
+  const showLoginLink = document.getElementById('show-login');
+  const showVerifyEmailFromLoginLink = document.getElementById('show-verify-email-from-login');
+  const backToLoginFromVerifyLink = document.getElementById('back-to-login-from-verify');
+  const showSettingsFromDashboardLink = document.getElementById('show-settings-from-dashboard');
+  const showSettingsFromLoginLink = document.getElementById('show-settings-from-login');
+  const backToDashboardFromSettingsLink = document.getElementById('back-to-dashboard-from-settings');
 
-    const showRegisterLink = document.getElementById('show-register');
-    const showLoginLink = document.getElementById('show-login');
-    const resendCodeLink = document.getElementById('resend-code');
-    const backToLoginFromVerifyLink = document.getElementById('back-to-login-from-verify');
-    const showVerifyEmailFromLoginLink = document.getElementById('show-verify-email-from-login');
+  // ====== Server status displays ======
+  const serverStatusIndicators = {
+    login: document.getElementById('server-status-indicator-login'),
+    dashboard: document.getElementById('server-status-indicator'),
+    settings: document.getElementById('server-status-indicator-settings'),
+    register: document.getElementById('server-status-indicator-register'),
+    verify: document.getElementById('server-status-indicator-verify'),
+  };
+  const serverStatusTexts = {
+    login: document.getElementById('server-status-text-login'),
+    dashboard: document.getElementById('server-status-text'),
+    settings: document.getElementById('server-status-text-settings'),
+    register: document.getElementById('server-status-text-register'),
+    verify: document.getElementById('server-status-text-verify'),
+  };
 
-    function showMessage(element, message, type = 'info') {
-        element.textContent = message;
-        element.className = `message-box ${type}`;
-        element.classList.remove('hidden');
+  let onMessageListener;
+
+  // ====== Utilities ======
+  function showSection(sectionId) {
+    [loginSection, registerSection, verifyEmailSection, dashboardSection, settingsSection].forEach(sec => {
+      if (sec) sec.classList.add('hidden');
+    });
+    const sectionToShow = document.getElementById(sectionId);
+    if (sectionToShow) sectionToShow.classList.remove('hidden');
+  }
+
+  function showMessage(element, message, type) {
+    if (!element) return;
+    element.textContent = message;
+    element.className = `message-box mt-4 visible ${type || ''}`;
+    element.classList.remove('hidden');
+}
+
+
+  function updateAllStatusDisplays(isReachable, text) {
+    Object.keys(serverStatusIndicators).forEach(key => {
+      if (serverStatusIndicators[key]) {
+        serverStatusIndicators[key].classList.toggle('bg-green-500', isReachable);
+        serverStatusIndicators[key].classList.toggle('bg-red-500', !isReachable);
+      }
+    });
+    Object.keys(serverStatusTexts).forEach(key => {
+      if (serverStatusTexts[key]) serverStatusTexts[key].textContent = text;
+    });
+  }
+
+  // ====== Auth + Stats ======
+  async function safeSendMessage(type, payload) {
+    try {
+      return await browser.runtime.sendMessage({ type, payload });
+    } catch (err) {
+      console.warn(`[Popup] Failed to send message ${type}:`, err);
+      return undefined;
+    }
+  }
+
+  async function getAuthStatus() {
+    // Check localStorage first
+    const storedUser = localStorage.getItem('pu_username');
+    const localAuth = storedUser ? { isLoggedIn: true, username: storedUser } : { isLoggedIn: false };
+
+    // Then check background (fail-safe)
+    const bgResponse = await safeSendMessage('GET_AUTH_STATUS');
+    if (bgResponse && typeof bgResponse.isLoggedIn !== 'undefined') {
+      if (bgResponse.isLoggedIn && bgResponse.username) {
+        localStorage.setItem('pu_username', bgResponse.username);
+      }
+      return bgResponse;
     }
 
-    function showSection(sectionId) {
-        loginSection.classList.add('hidden');
-        registerSection.classList.add('hidden');
-        verifyEmailSection.classList.add('hidden');
-        dashboardSection.classList.add('hidden');
-        document.getElementById(sectionId).classList.remove('hidden');
+    return localAuth;
+  }
+
+  async function checkLoginStatus() {
+    const response = await getAuthStatus();
+    if (response.isLoggedIn) {
+      dashboardUsername.textContent = response.username || 'User';
+      showSection('dashboard-section');
+    } else {
+      showSection('login-section');
     }
+  }
 
-    async function updateDashboardStats() {
-        const response = await chrome.runtime.sendMessage({ type: 'GET_STATS' });
-        if (response) {
-            successfulSentCount.textContent = response.successfulSentCount;
-            queueCountDisplay.textContent = response.queueCount;
+  async function updateDashboardStats(queueCount) {
+    const stats = await safeSendMessage('GET_STATS');
+    if (!stats) return; // fail silently if background busy
+    successfulSentCountEl.textContent = stats.successfulSentCount ?? 0;
+    queueCountDisplay.textContent = queueCount ?? stats.queueCount ?? 0;
+  }
 
-            // Update server status indicator
-            if (response.serverReachable) {
-                serverStatusIndicator.classList.remove('status-offline');
-                serverStatusIndicator.classList.add('status-online');
-                serverStatusText.textContent = 'Online';
-                serverStatusText.classList.remove('text-red-400');
-                serverStatusText.classList.add('text-green-400');
-            } else {
-                serverStatusIndicator.classList.remove('status-online');
-                serverStatusIndicator.classList.add('status-offline');
-                serverStatusText.textContent = 'Offline';
-                serverStatusText.classList.remove('text-green-400');
-                serverStatusText.classList.add('text-red-400');
-            }
-        }
-    }
+  // ====== Settings ======
+  async function renderMessageTypeSettings() {
+    const container = document.getElementById('message-type-settings-container');
+    if (!container) return;
 
-    async function checkLoginStatus() {
-        const response = await chrome.runtime.sendMessage({ type: 'CHECK_AUTH_STATUS' });
-        if (response && response.loggedIn) {
-            showSection('dashboard-section');
-            dashboardUsername.textContent = response.username;
-            consentPuDebug.checked = response.puDebugEnabled;
-            updateDashboardStats();
-            setInterval(updateDashboardStats, 2000); // Update stats every 2 seconds / rework this to work with each batch send to return server status
-        } else {
-            showSection('login-section');
-        }
-    }
+    // Clear and show loading text safely
+    container.textContent = 'Loading settings...';
+    container.classList.add('text-gray-500');
 
-    // Handle login form submission
-    loginForm.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const username = loginForm.username.value;
-        const password = loginForm.password.value;
+    const settings = await safeSendMessage('GET_MESSAGE_TYPE_SETTINGS');
+    if (!settings) return;
 
-        showMessage(loginMessage, 'Logging in...', 'info');
+    // Clear container
+    container.textContent = '';
+    container.classList.remove('text-gray-500');
 
-        try {
-            const response = await chrome.runtime.sendMessage({
-                type: 'LOGIN',
-                payload: { username, password }
-            });
+    Object.keys(settings).sort().forEach(type => {
+        const isChecked = settings[type];
 
-            if (response.success) {
-                showMessage(loginMessage, 'Login successful!', 'success');
-                await checkLoginStatus(); // Update UI
-            } else {
-                // Handle unverified email response
-                if (response.needs_email_verification && response.email) {
-                    showMessage(loginMessage, response.message, 'warning');
-                    document.getElementById('verify-email-input').value = response.email; // Pre-fill email
-                    showSection('verify-email-section');
-                } else {
-                    showMessage(loginMessage, response.message || 'Login failed.', 'error');
-                }
-            }
-        } catch (error) {
-            console.error('Login request failed:', error);
-            showMessage(loginMessage, 'An error occurred during login. Please check server connection.', 'error');
-        }
+        // Label wrapper
+        const label = document.createElement('label');
+        label.className = 'flex items-center justify-between text-gray-300 cursor-pointer';
+
+        // Span for type name
+        const spanType = document.createElement('span');
+        spanType.textContent = type;
+
+        // Toggle wrapper
+        const toggleWrapper = document.createElement('div');
+        toggleWrapper.className = 'toggle-switch';
+
+        // Checkbox
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.dataset.type = type;
+        checkbox.checked = !!isChecked;
+        checkbox.className = 'hidden';
+
+        // Slider span
+        const slider = document.createElement('span');
+        slider.className = 'slider';
+
+        toggleWrapper.appendChild(checkbox);
+        toggleWrapper.appendChild(slider);
+
+        label.appendChild(spanType);
+        label.appendChild(toggleWrapper);
+
+        container.appendChild(label);
     });
-
-    // Handle registration form submission
-    registerForm.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const username = registerForm.username.value;
-        const email = registerForm['register-email'].value;
-        const password = registerForm.password.value;
-
-        showMessage(registerMessage, 'Registering...', 'info');
-
-        try {
-            const response = await chrome.runtime.sendMessage({
-                type: 'REGISTER',
-                payload: { username, email, password }
-            });
-
-            if (response.success) {
-                showMessage(registerMessage, response.message, 'success');
-                registerForm.reset();
-                document.getElementById('verify-email-input').value = email; // Pre-fill email for verification
-                showSection('verify-email-section');
-            } else {
-                showMessage(registerMessage, response.message || 'Registration failed.', 'error');
-            }
-        } catch (error) {
-            console.error('Registration request failed:', error);
-            showMessage(registerMessage, 'An error occurred during registration. Please check server connection.', 'error');
-        }
-    });
-
-    // Handle email verification form submission
-    verifyEmailForm.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const email = verifyEmailForm['verify-email-input'].value;
-        const code = verifyEmailForm['verification-code'].value;
-
-        showMessage(verifyEmailMessage, 'Verifying email...', 'info');
-
-        try {
-            const response = await chrome.runtime.sendMessage({
-                type: 'VERIFY_EMAIL',
-                payload: { email, code }
-            });
-
-            if (response.success) {
-                showMessage(verifyEmailMessage, response.message, 'success');
-                verifyEmailForm.reset();
-                showSection('login-section');
-            } else {
-                showMessage(verifyEmailMessage, response.message || 'Verification failed.', 'error');
-            }
-        } catch (error) {
-            console.error('Email verification request failed:', error);
-            showMessage(verifyEmailMessage, 'An error occurred during verification. Please check server connection.', 'error');
-        }
-    });
-
-    // Handle logout button click
-    logoutButton.addEventListener('click', async () => {
-        try {
-            await chrome.runtime.sendMessage({ type: 'LOGOUT' });
-            showMessage(loginMessage, 'Logged out successfully.', 'info');
-            await checkLoginStatus();
-        } catch (error) {
-            console.error('Logout request failed:', error);
-            showMessage(loginMessage, 'An error occurred during logout.', 'error');
-        }
-    });
-
-    queueRemoveButton.addEventListener('click', async () => {
-        try {
-            await chrome.runtime.sendMessage({ type: 'QUEUEREMOVE'});
-            console.log('Removed messages queue!');
-        } catch (error) {
-            console.error('Remove message queue failed', error);
-        }
-    })
+}
 
 
+  async function saveMessageSettings() {
+    const checkboxes = document.querySelectorAll('#message-type-settings-container input[type="checkbox"]');
+    const settings = {};
+    checkboxes.forEach(cb => settings[cb.dataset.type] = cb.checked);
+    const response = await safeSendMessage('SAVE_MESSAGE_TYPE_SETTINGS', { settings });
+    showMessage(document.getElementById('settings-message'), 
+                response?.success ? 'Settings saved successfully!' : 'Failed to save settings.', 
+                response?.success ? 'success' : 'error');
+  }
 
-    // Handle pu-debug consent checkbox change
-    consentPuDebug.addEventListener('change', async (e) => {
-        const enabled = e.target.checked;
-        try {
-            const response = await chrome.runtime.sendMessage({
-                type: 'SET_PU_DEBUG_CONSENT',
-                payload: { enabled }
-            });
-            if (response.success) {
-                console.log(`PrUn Debugging ${enabled ? 'enabled' : 'disabled'}.`);
-            } else {
-                console.error('Failed to set pu-debug consent:', response.message);
-            }
-        } catch (error) {
-            console.error('Error setting pu-debug consent:', error);
-        }
-    });
+  // ====== Event Listeners ======
+  loginForm?.addEventListener('submit', async e => {
+    e.preventDefault();
+    const username = e.target.username.value;
+    const password = e.target.password.value;
+    const response = await safeSendMessage('LOGIN', { username, password });
+    if (response?.success) checkLoginStatus();
+    else showMessage(loginMessage, response?.message || 'Login failed', 'error');
+  });
 
-    // Event listeners for switching forms
-    showRegisterLink.addEventListener('click', (e) => {
-        e.preventDefault();
-        showSection('register-section');
-        loginMessage.classList.add('hidden');
-    });
+  registerForm?.addEventListener('submit', async e => {
+    e.preventDefault();
+    const username = e.target.username.value;
+    const password = e.target.password.value;
+    const email = e.target.email.value;
+    const response = await safeSendMessage('REGISTER', { username, password, email });
+    showMessage(registerMessage, response?.message || 'Error', response?.success ? 'success' : 'error');
+    if (response?.success) showSection('verify-email-section');
+  });
 
-    showLoginLink.addEventListener('click', (e) => {
-        e.preventDefault();
-        showSection('login-section');
-        registerMessage.classList.add('hidden');
-        verifyEmailMessage.classList.add('hidden');
-    });
+  verifyEmailForm?.addEventListener('submit', async e => {
+    e.preventDefault();
+    const email = e.target.email.value;
+    const code = e.target.code.value;
+    const response = await safeSendMessage('VERIFY_EMAIL', { email, code });
+    showMessage(verifyEmailMessage, response?.message || 'Error', response?.success ? 'success' : 'error');
+    if (response?.success) await checkLoginStatus();
+  });
 
-    resendCodeLink.addEventListener('click', async (e) => {
-        e.preventDefault();
-        const email = document.getElementById('verify-email-input').value;
-        if (!email) {
-            showMessage(verifyEmailMessage, 'Please enter your email to resend the code.', 'warning');
-            return;
-        }
-        showMessage(verifyEmailMessage, 'Resending code...', 'info');
-        try {
-            const response = await chrome.runtime.sendMessage({
-                type: 'RESEND_VERIFICATION_CODE',
-                payload: { email }
-            });
-            if (response.success) {
-                showMessage(verifyEmailMessage, response.message, 'success');
-            } else {
-                showMessage(verifyEmailMessage, response.message || 'Failed to resend code.', 'error');
-            }
-        } catch (error) {
-            console.error('Resend code request failed:', error);
-            showMessage(verifyEmailMessage, 'An error occurred while resending code. Please check server connection.', 'error');
-        }
-    });
-
-    backToLoginFromVerifyLink.addEventListener('click', (e) => {
-        e.preventDefault();
-        showSection('login-section');
-        verifyEmailMessage.classList.add('hidden');
-    });
-
-    showVerifyEmailFromLoginLink.addEventListener('click', (e) => {
-        e.preventDefault();
-        showSection('verify-email-section');
-        loginMessage.classList.add('hidden');
-    });
-
-    // Initial check
+  logoutButton?.addEventListener('click', async () => {
+    await safeSendMessage('LOGOUT');
+    localStorage.removeItem('pu_username');
     checkLoginStatus();
+  });
+
+  consentPuDebug?.addEventListener('change', async e => {
+    await safeSendMessage('TOGGLE_DEBUG', { enabled: e.target.checked });
+  });
+
+  queueRemoveButton?.addEventListener('click', async () => {
+    await safeSendMessage('REMOVE_ALL_QUEUE_ITEMS');
+  });
+
+  showRegisterLink?.addEventListener('click', e => { e.preventDefault(); showSection('register-section'); });
+  showLoginLink?.addEventListener('click', e => { e.preventDefault(); showSection('login-section'); });
+  showVerifyEmailFromLoginLink?.addEventListener('click', e => { e.preventDefault(); showSection('verify-email-section'); });
+  backToLoginFromVerifyLink?.addEventListener('click', e => { e.preventDefault(); showSection('login-section'); });
+  showSettingsFromDashboardLink?.addEventListener('click', e => { e.preventDefault(); showSection('settings-section'); renderMessageTypeSettings(); });
+  showSettingsFromLoginLink?.addEventListener('click', e => { e.preventDefault(); showSection('settings-section'); renderMessageTypeSettings(); });
+  backToDashboardFromSettingsLink?.addEventListener('click', e => { e.preventDefault(); showSection('dashboard-section'); });
+  saveSettingsButton?.addEventListener('click', saveMessageSettings);
+
+  // ====== Background push updates ======
+  onMessageListener = msg => {
+    if (!msg?.type) return;
+    if (msg.type === 'SERVER_STATUS_UPDATED') {
+      updateAllStatusDisplays(!!msg.serverReachable, msg.serverReachable ? 'Online' : 'Offline');
+      updateDashboardStats(msg.queueCount);
+    } else if (msg.type === 'AUTH_STATUS_UPDATED') {
+      checkLoginStatus();
+    } else if (msg.type === 'QUEUE_COUNT_UPDATED') {
+      updateDashboardStats(msg.queueCount);
+    }
+  };
+  browser.runtime.onMessage.addListener(onMessageListener);
+
+  // ====== Initial load ======
+  await checkLoginStatus();
+  await updateDashboardStats();
+
+  try {
+    const forced = await safeSendMessage('FORCE_SERVER_CHECK');
+    updateAllStatusDisplays(!!forced?.serverReachable, forced?.serverReachable ? 'Online' : 'Offline');
+  } catch (e) {
+    console.warn('Initial server check failed:', e);
+  }
+
+  window.addEventListener('unload', () => {
+    if (onMessageListener) browser.runtime.onMessage.removeListener(onMessageListener);
+  });
 });

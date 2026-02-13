@@ -1,39 +1,70 @@
 {
   "manifest_version": 3,
   "name": "PUNoted Data Forwarder",
-  "version": "1.0",
+  "version": "1.2.0",
   "description": "Browser extension to capture Prosperous Universe data, authenticate users, and forward data in batches.",
-  "permissions": [
-    "scripting",
-    "storage",
-    "cookies"
-  ],
   "host_permissions": [
-    "https://apex.prosperousuniverse.com/*"
+    "https://apex.prosperousuniverse.com/*",
+    "https://punoted.ddns.net/*"
+  ],
+  "permissions": [
+    "storage",
+    "alarms",
+    "tabs"
   ],
   "action": {
     "default_popup": "popup.html",
     "default_icon": {
-      "16": "icons/icon16.png"
+      "128": "icons/icon128.png"
     }
   },
   "background": {
-    "service_worker": "background.js"
+    "scripts": [
+      "background.js"
+    ],
+    "type": "module"
   },
   "content_scripts": [
     {
-      "matches": ["https://apex.prosperousuniverse.com/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://apex.prosperousuniverse.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_start"
-    }
+    },
+  {
+    "matches": ["https://punoted.ddns.net/*"],
+    "js": ["web_sync.js"],
+    "run_at": "document_idle"
+  }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["injected-script.js", "prun-message-decoder.js"],
-      "matches": ["https://apex.prosperousuniverse.com/*"]
+      "resources": [
+        "injected-script.js",
+        "prun-message-decoder.js"
+      ],
+      "matches": [
+        "https://apex.prosperousuniverse.com/*"
+      ]
     }
   ],
   "icons": {
-    "16": "icons/icon16.png"
+    "128": "icons/icon128.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; default-src 'self' https://punoted.ddns.net https://cdn.jsdelivr.net;"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "{f5e9c0b2-4276-4a7d-a963-4cfe81882afe}",
+      "strict_min_version": "142.0",
+      "data_collection_permissions": {
+        "required": ["authenticationInfo", "websiteContent"]
+      }
+    },
+    "gecko_android": {}
   }
 }

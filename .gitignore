@@ -1,1 +1,12 @@
+# Firefox/Chrome Extension Junk
 .history
+web-ext-artifacts
+.web-extension-id
+.amo-upload-uuid
+web-ext-artifacts/
+*.zip
+*.xpi
+
+# Secrets
+.env
+node_modules/
