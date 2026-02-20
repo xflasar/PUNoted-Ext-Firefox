@@ -5,11 +5,11 @@ const initializationPromise = new Promise((res) => {
 });
 
 // ------------------ Config & State ------------------
-const SERVER_URL = "https://punoted.ddns.net/api/auth";
-const DATA_SERVER_URL = "https://punoted.ddns.net/api";
+const SERVER_URL = "https://api.punoted.net/auth";
+const DATA_SERVER_URL = "https://api.punoted.net";
 const QUEUE_DB_NAME = "prunDataQueue";
 const QUEUE_STORE_NAME = "dataItems";
-const MAX_PAYLOAD_SIZE = 50_000;
+const MAX_PAYLOAD_SIZE = 15 * 1024 * 1024; // 15,728,640 bytes
 const MIN_INTERVAL = 500;
 const MAX_INTERVAL = 10000;
 
@@ -26,6 +26,8 @@ let isSending = false;
 let lastRequestDuration = 0;
 let currentBatchInterval = 1000;
 let batchIntervalId = null;
+
+const encoder = new TextEncoder();
 
 // --- Message Type Groups ---
 const HARDCODED_IGNORED_MESSAGE_TYPES = [
@@ -140,7 +142,7 @@ const USER_CONTROLLABLE_MESSAGE_TYPES_DEFAULTS = {
 browser.runtime.onInstalled.addListener((details) => {
 	if (details.reason === "install") {
 		// Automatically open the website to trigger the web_sync
-		browser.tabs.create({ url: "https://punoted.ddns.net/" });
+		browser.tabs.create({ url: "https://punoted.net/" });
 	}
 });
 
@@ -266,7 +268,7 @@ browser.runtime.onMessage.addListener(async (request, sender) => {
 
 // ------------------ Core Functions ------------------
 
-const EXTENSION_HEADER = { "X-Extension-Client": "PrunDataExtension" };
+const EXTENSION_HEADER = { "X-Extension-Client": "PrunDataExtension-Firefox" };
 
 async function syncWithWebToken(webToken) {
 	try {
@@ -320,107 +322,108 @@ async function syncWithWebToken(webToken) {
 }
 
 async function runBatch() {
-	if (isSending || !auth_token || !serverReachable) return;
-	isSending = true;
-	const start = Date.now();
+  if (isSending || !auth_token || !serverReachable) return;
+  isSending = true;
+  const start = Date.now();
 
-	try {
-		const db = await openDb();
-		const tx = db.transaction([QUEUE_STORE_NAME], "readonly");
-		const store = tx.objectStore(QUEUE_STORE_NAME);
+  try {
+    const db = await openDb();
+    const tx = db.transaction([QUEUE_STORE_NAME], "readonly");
+    const store = tx.objectStore(QUEUE_STORE_NAME);
 
-		// 1. We only look at a small window of items to avoid loading 100MB into RAM
-		const allItems = await new Promise((r) => {
-			const items = [];
-			const req = store.openCursor();
-			req.onsuccess = (e) => {
-				const cursor = e.target.result;
-				// Limit the CURSOR to 500 items max to protect background memory
-				if (cursor && items.length < 500) {
-					items.push({ key: cursor.key, value: cursor.value });
-					cursor.continue();
-				} else r(items);
-			};
-		});
+    // 1. Fetch window (increased to 1000 to allow filling the 15MB batch better)
+    const allItems = await new Promise((r) => {
+      const items = [];
+      const req = store.openCursor();
+      req.onsuccess = (e) => {
+        const cursor = e.target.result;
+        if (cursor && items.length < 1000) {
+          items.push({ key: cursor.key, value: cursor.value });
+          cursor.continue();
+        } else r(items);
+      };
+    });
 
-		if (allItems.length === 0) {
-			isSending = false;
-			return;
-		}
+    if (allItems.length === 0) {
+      isSending = false;
+      return;
+    }
 
-		// 2. Build exactly ONE batch that stays under MAX_PAYLOAD_SIZE
-		let batch = [];
-		let batchSize = 0;
-		let itemsProcessed = 0;
+    // 2. Greedy Batch Construction
+    let batch = [];
+    let batchSizeBytes = 2; // Initial [] brackets
+    let keysInBatch = [];
+    let itemsProcessed = 0;
 
-		for (const item of allItems) {
-			const serialized = JSON.stringify(item.value);
-			const itemBytes = serialized.length;
+    for (const item of allItems) {
+      const serialized = JSON.stringify(item.value);
+      const itemBytes = encoder.encode(serialized).length;
 
-			// If a single message is bigger than the whole limit, drop it (unblocks queue)
-			if (itemBytes > MAX_PAYLOAD_SIZE) {
-				console.warn(
-					"[Sync] Dropping monster message to unblock queue",
-					item.key,
-				);
-				await clearIndexedDB([item.key]);
-				continue;
-			}
+      // Single item check
+      if (itemBytes > MAX_PAYLOAD_SIZE) {
+        console.warn("[Sync] Dropping monster message", item.key);
+        await clearIndexedDB([item.key]);
+        itemsProcessed++; // Mark as seen to skip in next slicing
+        continue;
+      }
 
-			if (batchSize + itemBytes > MAX_PAYLOAD_SIZE) break;
+      // Check if adding this exceeds 15MB (item + comma)
+      if (batchSizeBytes + itemBytes + 1 > MAX_PAYLOAD_SIZE) {
+        // If batch is full, stop adding and send what we have
+        break;
+      }
 
-			batch.push(item.value);
-			batchSize += itemBytes;
-			itemsProcessed++;
-		}
+      batch.push(item.value);
+      keysInBatch.push(item.key);
+      batchSizeBytes += itemBytes + 1;
+      itemsProcessed++;
+    }
 
-		if (batch.length === 0) {
-			isSending = false;
-			return;
-		}
+    if (batch.length === 0) {
+      // This only happens if all items were skipped/monster messages
+      isSending = false;
+      if (itemsProcessed < allItems.length) setTimeout(runBatch, 1000);
+      return;
+    }
 
-		// 3. Send the single safe batch
-		const compressedBody = await gzipPayload({ data: batch });
-		const resp = await fetch(
-			`${DATA_SERVER_URL}/data_batch?conn=${encodeURIComponent(username)}`,
-			{
-				method: "POST",
-				headers: {
-					Authorization: `Bearer ${auth_token}`,
-					"Content-Encoding": "gzip",
-					"Content-Type": "application/json",
-				},
-				body: compressedBody,
-			},
-		);
+    // 3. Send the single safe batch
+    const compressedBody = await gzipPayload({ data: batch });
+    const resp = await fetch(
+      `${DATA_SERVER_URL}/data_batch?conn=${encodeURIComponent(username)}`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${auth_token}`,
+          "Content-Encoding": "gzip",
+          "Content-Type": "application/json",
+        },
+        body: compressedBody,
+      },
+    );
 
-		if (resp.ok) {
-			const keysToClear = allItems.slice(0, itemsProcessed).map((i) => i.key);
-			await clearIndexedDB(keysToClear);
-
-			if (allItems.length >= 500 || itemsProcessed < allItems.length) {
-				setTimeout(runBatch, 1000);
-			}
-		} else if (resp.status === 400 || resp.status === 408) {
-			console.error(
-				`[Sync] Server returned ${resp.status}. Clearing malformed batch.`,
-			);
-			const keysToClear = allItems.slice(0, itemsProcessed).map((i) => i.key);
-			await clearIndexedDB(keysToClear);
-
-			setTimeout(runBatch, 1000);
-		} else if (resp.status === 401 || resp.status === 403) {
-			await logoutUser();
-		} else {
-			serverReachable = false;
-		}
-	} catch (e) {
-		serverReachable = false;
-	} finally {
-		lastRequestDuration = Date.now() - start;
-		adjustBatchInterval();
-		isSending = false;
-	}
+    if (resp.ok) {
+      await clearIndexedDB(keysInBatch);
+      // If we didn't finish the queue or reached the cursor limit, run again
+      if (allItems.length >= 1000 || itemsProcessed < allItems.length) {
+        setTimeout(runBatch, 1000);
+      }
+    } else if (resp.status === 400 || resp.status === 408) {
+      console.error(`[Sync] Server error ${resp.status}. Clearing batch.`);
+      await clearIndexedDB(keysInBatch);
+      setTimeout(runBatch, 1000);
+    } else if (resp.status === 401 || resp.status === 403) {
+      await logoutUser();
+    } else {
+      serverReachable = false;
+    }
+  } catch (e) {
+    serverReachable = false;
+    console.error("[Sync] Runtime error", e);
+  } finally {
+    lastRequestDuration = Date.now() - start;
+    adjustBatchInterval();
+    isSending = false;
+  }
 }
 
 // ------------------ Helpers ------------------
@@ -583,7 +586,7 @@ function adjustBatchInterval() {
 
 		// 1. Try to find if the tab is already open and wake it up
 		const tabs = await browser.tabs.query({
-			url: "https://punoted.ddns.net/*",
+			url: "https://punoted.net/*",
 		});
 		if (tabs.length > 0) {
 			browser.tabs
@@ -591,7 +594,7 @@ function adjustBatchInterval() {
 				.catch(() => {});
 		} else {
 			// 2. If not open, open it so web_sync.js can do its job
-			browser.tabs.create({ url: "https://punoted.ddns.net/" });
+			browser.tabs.create({ url: "https://punoted.net/" });
 		}
 	}
 
