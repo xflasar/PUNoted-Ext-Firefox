@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "PUNoted Data Forwarder",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Browser extension to capture Prosperous Universe data, authenticate users, and forward data in batches.",
   "host_permissions": [
     "https://apex.prosperousuniverse.com/*",
@@ -59,7 +59,6 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "{f5e9c0b2-4276-4a7d-a963-4cfe81882afe}",
-      "strict_min_version": "142.0",
       "data_collection_permissions": {
         "required": ["authenticationInfo", "websiteContent"]
       }
